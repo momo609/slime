@@ -38,7 +38,7 @@ def execute():
         "--rm-type deepscaler "
         "--num-rollout 3 "
         "--rollout-batch-size 8 "
-        "--n-samples-per-prompt 4 "
+        "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 8192 "
         "--rollout-temperature 1 "
         "--global-batch-size 32 "
@@ -77,6 +77,7 @@ def execute():
         "--eps-clip 4e-4 "
         "--use-tis "
         "--use-rollout-routing-replay "
+        "--use-slime-router "
     )
 
     optimizer_args = (
@@ -94,7 +95,6 @@ def execute():
     sglang_args = (
         "--rollout-num-gpus-per-engine 8 "
         "--sglang-mem-fraction-static 0.8 "
-        "--sglang-cuda-graph-max-bs 32 "
         "--sglang-max-running-requests 512 "
         "--sglang-enable-metrics "
     )

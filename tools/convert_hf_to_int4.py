@@ -55,14 +55,16 @@ def get_calibration_dataset(tokenizer, num_samples, seq_len, local_data_path):
 def main():
     args = parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.input_dir, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    ds_hf = get_calibration_dataset(tokenizer, args.num_calibration_samples, args.max_sequence_length, args.data_dir)
+    ds_hf = get_calibration_dataset(
+        tokenizer, args.num_calibration_samples, args.max_sequence_length, args.local_data_path
+    )
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.input_dir,
+        args.model_id,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=args.trust_remote_code,
@@ -76,7 +78,6 @@ def main():
         "re:.*self_attn.*",
         "re:.*shared_experts.*",
         "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
-        "re:.*mlp\\.gate\\.*",
     ]
 
     recipe = GPTQModifier(
@@ -84,7 +85,7 @@ def main():
         scheme=args.quant_type,
         ignore=ignore_patterns,
         dampening_frac=args.dampening_frac,
-        block_size=args.quant_group_size,
+        block_size=32,
     )
 
     oneshot(

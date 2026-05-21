@@ -1,7 +1,6 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
-import re
 from contextlib import nullcontext
 from typing import Literal
 
@@ -18,6 +17,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
+import slime_plugins.patch.mbridge_patch
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -34,9 +34,7 @@ class LinearForLastLayer(torch.nn.Linear):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
-            if bias:
-                self.bias.sequence_parallel = True
-
+            self.bias.sequence_parallel = True
         self.weight.data.normal_(mean=0.0, std=0.02)
         if bias:
             self.bias.data.zero_()
@@ -54,10 +52,59 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def get_qwen3vl_provide_wrapper(provider, role):
+
+    def provide_wrapper(pre_process=None, post_process=None, vp_stage=None):
+        """
+        Provide a Qwen3VL MoE model instance with vision and language components.
+        """
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+        language_transformer_config = provider
+
+        # Create vision transformer config - placeholder for future use
+        hf_config = provider.vision_config
+
+        language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=provider.num_moe_experts,
+            moe_grouped_gemm=True,
+            qk_layernorm=provider.qk_layernorm,
+            fp8=False,
+            normalization="RMSNorm",
+        )
+
+        # reuse Qwen3VLModel for MoE model but replace the language model with MoE language model
+        model = Qwen3VLModel(
+            language_transformer_config=language_transformer_config,
+            language_transformer_layer_spec=language_transformer_layer_spec,
+            vision_transformer_config=hf_config,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
+
+        if role == "critic" and post_process:
+            model.language_model.output_layer = LinearForLastLayer(input_size=provider.hidden_size, output_size=1, config=provider).to(
+                device=model.language_model.output_layer.weight.device,
+                dtype=model.language_model.output_layer.weight.dtype,
+            )
+
+        # Apply freeze options if any are enabled for fine-tuning
+        if provider.freeze_language_model or provider.freeze_vision_model or provider.freeze_vision_projection:
+            model.freeze(
+                freeze_language_model=provider.freeze_language_model,
+                freeze_vision_model=provider.freeze_vision_model,
+                freeze_vision_projection=provider.freeze_vision_projection,
+            )
+
+        return model
+    return provide_wrapper
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    AutoMapping.register_module_type('LinearForLastLayer', 'replicated')  # 或 'column' / 'replicated'
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -81,11 +128,9 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
+        from slime.utils.megatron_bridge_utils import get_bridge
 
-        import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        bridge = get_bridge(args.hf_checkpoint)
         provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
@@ -93,29 +138,33 @@ def get_model_provider_func(
         provider.expert_model_parallel_size = args.expert_model_parallel_size
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
-        provider.context_parallel_size = args.context_parallel_size
-        provider.variable_seq_lengths = args.variable_seq_lengths
-        if hasattr(args, "moe_token_dispatcher_type"):
-            provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
-        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        provider.moe_permute_fusion = args.moe_permute_fusion
+        provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+        provider.freeze_language_model = False
+        provider.freeze_vision_model = False
+        # Recompute settings - enable these if memory is insufficient
+        provider.recompute_granularity = args.recompute_granularity
+        provider.recompute_method = args.recompute_method
+        provider.recompute_num_layers = args.recompute_num_layers
+        for key, value in vars(args).items():
+            if hasattr(provider, key):
+                continue
+            setattr(provider, key, value)
+
+        is_qwen3vl = (
+            hasattr(bridge.hf_pretrained, 'config') 
+            and hasattr(bridge.hf_pretrained.config, 'model_type') 
+            and 'qwen3_vl' in bridge.hf_pretrained.config.model_type.lower()
+        )
+
+        if role == 'critic' and is_qwen3vl:
+            from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+            from slime_plugins.patch.critic_patch import load_weights_hf_to_megatron_wrapper
+            MegatronModelBridge.load_weights_hf_to_megatron = load_weights_hf_to_megatron_wrapper
+            provider.provide = get_qwen3vl_provide_wrapper(provider, role)
+
         provider.finalize()
-
-        if role == "critic":
-            _original_provide = provider.provide
-
-            def _critic_provide(pre_process=True, post_process=True, vp_stage=None):
-                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-                if post_process:
-                    model.output_layer = LinearForLastLayer(
-                        input_size=model.config.hidden_size, output_size=1, config=model.config
-                    )
-                return model
-
-            return _critic_provide
-
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -226,35 +275,3 @@ def get_model_provider_func(
         return model
 
     return model_provider
-
-
-def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
-        sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
-
-        freeze_model_params(model, args)
-
-        return model
-
-    return wrapped_provider
-
-
-def freeze_model_params(model: GPTModel, args: argparse.Namespace):
-    if args.only_train_params_name_list:
-        for name, param in model.named_parameters():
-            param.requires_grad = False
-            for pattern in args.only_train_params_name_list:
-                if re.search(pattern, name):
-                    param.requires_grad = True
-                    break
-
-    if args.freeze_params_name_list:
-        for name, param in model.named_parameters():
-            for pattern in args.freeze_params_name_list:
-                if re.search(pattern, name):
-                    param.requires_grad = False
-                    break

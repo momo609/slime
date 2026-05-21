@@ -91,7 +91,6 @@ def execute():
         "--rollout-num-gpus-per-engine 2 "
         "--rollout-num-gpus 8 "
         "--sglang-mem-fraction-static 0.8 "
-        "--sglang-cuda-graph-max-bs 8 "
         "--sglang-enable-metrics "
         "--sglang-speculative-algorithm EAGLE "
         "--sglang-speculative-num-steps 2 "

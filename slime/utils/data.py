@@ -89,30 +89,15 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
         return origin_samples
 
     if processor:
-        # Use processor only for samples with actual multimodal content; use batched tokenizer for text-only.
-        text_only = []
-        multimodal = []
-        for sample in origin_samples:
-            if sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
-                multimodal.append(sample)
-            else:
-                text_only.append(sample)
         filtered_samples = []
-        if text_only:
-            prompts = [s.prompt for s in text_only]
-            input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-            for sample, input_ids in zip(text_only, input_ids_list, strict=True):
-                if len(input_ids) <= max_length:
-                    filtered_samples.append(sample)
-        if multimodal:
+        for sample in origin_samples:
             from slime.utils.processing_utils import process_vision_info
 
-            for sample in multimodal:
-                multimodal_inputs = process_vision_info(sample.prompt, processor)
-                processor_output = processor(text=sample.prompt, **multimodal_inputs)
-                input_ids = processor_output["input_ids"][0]
-                if len(input_ids) <= max_length:
-                    filtered_samples.append(sample)
+            multimodal_inputs = process_vision_info(sample.prompt, processor)
+            processor_output = processor(text=sample.prompt, **multimodal_inputs)
+            input_ids = processor_output["input_ids"][0]
+            if len(input_ids) <= max_length:
+                filtered_samples.append(sample)
     else:
         prompts = [sample.prompt for sample in origin_samples]
         input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
@@ -143,9 +128,7 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
         for type_name, data_key in multimodal_keys.items():
             mt = MultimodalTypes.get(type_name)
             if mt:
-                multimodal_data = data.get(data_key)
-                if multimodal_data is not None:
-                    multimodals[mt.placeholder] = (mt, list(multimodal_data))
+                multimodals[mt.placeholder] = (mt, list(data.get(data_key)))
 
         pattern = "(" + "|".join(re.escape(p) for p in multimodals.keys()) + ")"
 
@@ -157,10 +140,6 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
                         continue
                     if segment in multimodals:
                         mt, content = multimodals[segment]
-                        assert len(content) > 0, (
-                            f"Not enough {mt.name} data: more '{mt.placeholder}' placeholders in prompt "
-                            f"than {mt.name}s provided in data"
-                        )
                         content_list.append({"type": mt.name, mt.name: content.pop(0)})
                     else:
                         content_list.append({"type": "text", "text": segment})
@@ -182,12 +161,6 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
                 raise ValueError(
                     f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
                 )
-
-        for placeholder, (mt, remaining) in multimodals.items():
-            assert len(remaining) == 0, (
-                f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s)"
-                f"than '{placeholder}' placeholders in prompt"
-            )
 
     return prompt
 

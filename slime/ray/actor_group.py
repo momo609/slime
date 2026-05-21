@@ -5,6 +5,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from slime.utils.common import is_npu
 
 
 class RayTrainGroup:
@@ -76,37 +77,41 @@ class RayTrainGroup:
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
-        from slime.backends.megatron_utils.actor import MegatronTrainRayActor
+        backend = self.args.train_backend
+        if backend == "megatron":
+            from slime.backends.megatron_utils.actor import MegatronTrainRayActor
 
-        actor_impl = MegatronTrainRayActor
+            actor_impl = MegatronTrainRayActor
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        else:
+            from slime.backends.fsdp_utils import FSDPTrainRayActor
 
+            actor_impl = FSDPTrainRayActor
+
+        TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
+        device_name = "NPU" if is_npu() else "GPU"
         # Create worker actors
         self._actor_handlers = []
         master_addr, master_port = None, None
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
                 ),
+                resources={device_name: num_gpus_per_actor}
             ).remote(world_size, rank, master_addr, master_port)
             if rank == 0:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
 
-    def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
+    def async_init(self, args, role, with_ref=False):
         """
         Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
         """
         self.args = args
-        return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
-            for actor in self._actor_handlers
-        ]
+        return [actor.init.remote(args, role, with_ref=with_ref) for actor in self._actor_handlers]
 
     def async_train(self, rollout_id, rollout_data_ref):
         """Do one rollout training"""

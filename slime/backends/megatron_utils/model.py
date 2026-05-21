@@ -28,7 +28,7 @@ from slime.utils.memory_utils import clear_memory
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .model_provider import get_model_provider_func
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +105,7 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
-    )
+    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
     kwargs = {}
@@ -217,7 +215,6 @@ def forward_only(
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
-            args.allgather_cp,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -260,6 +257,7 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
+        # collect_non_loss_data
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -268,6 +266,7 @@ def forward_only(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
+            collect_non_loss_data=True,
         )
 
     # Move model back to the train mode.
@@ -371,11 +370,11 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "max_seq_lens",
-                "teacher_log_probs",
+                "hidden_states",
+                "target_scores"
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
-            args.allgather_cp,
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
@@ -486,6 +485,16 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def finalize_model_grads_with_empty_cache(*args, **kwargs):
+    # trigger empty cache when there are less than 10% free memory before the final reduce scatter.
+    # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
+    device = torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(device)
+    if free / total < 0.1:
+        clear_memory()
+    return finalize_model_grads(*args, **kwargs)
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -536,7 +545,7 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
 
     pre_hook_enabled = False
 
@@ -552,11 +561,6 @@ def train(
                 if "step" in group:
                     group["step"] = 0
             for state in chained_optimizer.optimizer.state.values():
-                if "step" in state:
-                    if isinstance(state["step"], torch.Tensor):
-                        state["step"].zero_()
-                    else:
-                        state["step"] = 0
                 if "exp_avg" in state:
                     state["exp_avg"].zero_()
                 if "exp_avg_sq" in state:
@@ -652,10 +656,13 @@ def train(
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
-                    # TODO: figure out why KL is not exactly zero when using PPO loss with KL clipping, and whether this is expected behavior or a bug.
-                    assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
+                    if args.multi_latent_attention:
+                        # TODO: mla currently have non-zero kl, need further investigation
+                        assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
+                    else:
+                        assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
                 if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
-                    assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
+                    assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
 
@@ -724,15 +731,14 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     )
 
     try:
-        from megatron.bridge import AutoBridge
-        from slime.utils.megatron_bridge_utils import patch_megatron_model
+        from slime.utils.megatron_bridge_utils import get_bridge, patch_megatron_model
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
 
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        bridge = get_bridge(args.hf_checkpoint)
 
         path.mkdir(parents=True, exist_ok=True)
 
@@ -781,5 +787,7 @@ def initialize_model_and_optimizer(
         skip_load_to_model_and_opt=False,
     )
     clear_memory()
+
+    opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
     return model, optimizer, opt_param_scheduler, iteration

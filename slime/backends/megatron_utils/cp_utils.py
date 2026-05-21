@@ -81,9 +81,8 @@ def get_sum_of_sample_mean(
             )
 
     else:
-        cp_chunk_lengths: list[int] = []
-        chunked_loss_masks: list[torch.Tensor] = []
-
+        cp_chunk_lengths = []
+        chunked_loss_masks = []
         for i, (total_length, response_length, loss_mask) in enumerate(
             zip(total_lengths, response_lengths, loss_masks, strict=False)
         ):

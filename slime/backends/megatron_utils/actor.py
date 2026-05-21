@@ -5,7 +5,6 @@ import socket
 from argparse import Namespace
 from contextlib import nullcontext
 
-import numpy as np
 import ray
 import torch
 import torch.distributed as dist
@@ -25,6 +24,7 @@ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
+from slime.utils.common import is_npu
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
@@ -50,14 +50,10 @@ class MegatronTrainRayActor(TrainRayActor):
         args: Namespace,
         role: str,
         with_ref: bool = False,
-        with_opd_teacher: bool = False,
     ) -> int | None:
-        if args.debug_rollout_only:
-            self.args = args
-            return 0
-
         monkey_patch_torch_dist()
-        super().init(args, role, with_ref, with_opd_teacher)
+
+        super().init(args, role, with_ref)
 
         init(args)
 
@@ -67,11 +63,13 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof = TrainProfiler(args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
-        for i in range(args.num_gpus_per_node):
-            if i == dist.get_rank() % args.num_gpus_per_node:
+        for i in range(dist.get_world_size()):
+            if i == dist.get_rank():
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
+        # print("#########self.tokenizer", self.tokenizer.pad_token_id)
+        self.args.pad_token_id = self.tokenizer.pad_token_id
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -83,6 +81,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
+        if self.args.debug_rollout_only:
+            return 0
+
         if role == "critic":
             self.args.load = self.args.critic_load
             self.args.save = self.args.critic_save
@@ -93,12 +94,12 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
-        start_rollout_id = loaded_rollout_id + 1
-
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
-            return start_rollout_id
+            return
+
+        start_rollout_id = loaded_rollout_id + 1
 
         self.weights_backuper = TensorBackuper.create(
             source_getter=lambda: named_params_and_buffers(
@@ -115,10 +116,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
 
-        # Load teacher model for Megatron-based on-policy distillation
-        if with_opd_teacher:
-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
-
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
             self.load_other_checkpoint("old_actor", args.load)
@@ -127,10 +124,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("rollout_actor")
 
         if self.args.vocab_size is None:
-            # Prefer HF config vocab_size (which may include model-native padding)
-            # over tokenizer vocab_size (which may be smaller, e.g. GPT-OSS).
-            hf_vocab = getattr(self.hf_config, "vocab_size", None)
-            self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
+            self.args.vocab_size = self.tokenizer.vocab_size
+
+        if hasattr(self.args, 'enable_eagle3_training') and self.args.enable_eagle3_training:
+            from slime.backends.megatron_utils.eagle3_actor_patch import apply_eagle3_patches_if_enabled
+            apply_eagle3_patches_if_enabled(self)
 
         update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
@@ -139,7 +137,9 @@ class MegatronTrainRayActor(TrainRayActor):
             weights_getter=lambda: self.weights_backuper.get("actor"),
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
+            eagle3_manager=self.eagle3_manager,
         )
+        
 
         # empty cache after initialization
         clear_memory()
@@ -156,8 +156,10 @@ class MegatronTrainRayActor(TrainRayActor):
             from slime.utils.misc import load_function
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
-
+        
+        
         self.prof.on_init_end()
+        self.eagle_train_step = 0
 
         return start_rollout_id
 
@@ -205,14 +207,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [
                 (
-                    {
-                        key: (
-                            torch.from_numpy(v.copy()).to(device=torch.cuda.current_device())
-                            if isinstance(v, np.ndarray)
-                            else v.to(device=torch.cuda.current_device())
-                        )
-                        for key, v in mm_dict.items()
-                    }
+                    {key: tensor.to(device=torch.cuda.current_device()) for key, tensor in mm_dict.items()}
                     if mm_dict is not None
                     else None
                 )
@@ -361,19 +356,70 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
-        if self.args.debug_rollout_only:
-            return
-
+        # print("################actor train")
         if self.args.offload_train:
             self.wake_up()
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
+            if self.args.debug_rollout_only:
+                log_rollout_data(rollout_id, self.args, rollout_data)
+                return
 
+        # if self.role == "critic":
+        #     return self.train_critic(rollout_id, rollout_data)
+        # else:
+        #     return self.train_actor(rollout_id, rollout_data)
+        
         if self.role == "critic":
-            return self.train_critic(rollout_id, rollout_data)
+            self.train_critic(rollout_id, rollout_data)
         else:
-            return self.train_actor(rollout_id, rollout_data)
+            self.train_actor(rollout_id, rollout_data)
+        
+        logger.info(f"[Eagle3 Patch] Original train completed for rollout_id={rollout_id}")
+
+        # Train Eagle3 drafter if enabled
+        if hasattr(self, 'eagle3_manager'):
+            logger.info(f"[Eagle3 Patch] eagle3_manager exists: {self.eagle3_manager}")
+            logger.info(f"[Eagle3 Patch] eagle3_manager.is_initialized: {self.eagle3_manager.is_initialized}")
+        else:
+            logger.warning(f"[Eagle3 Patch] eagle3_manager does not exist!")
+            return
+
+        if self.eagle3_manager.is_initialized:
+            eagle3_manager = self.eagle3_manager
+
+            # Collect rollout data for Eagle3 training
+            rollout_data = self._get_rollout_data(rollout_data_ref)
+            logger.info(f"[Eagle3 Patch] rollout_data keys: {rollout_data.keys()}")
+            logger.info(f"[Eagle3 Patch] rollout_data num_samples: {len(rollout_data.get('tokens', []))}")
+
+            # Extract hidden states if available
+            hidden_states = rollout_data.get('hidden_states', None)
+            logger.info(f"[Eagle3 Patch] hidden_states available: {hidden_states is not None} rollout id {rollout_id}")
+            if hidden_states is not None:
+                logger.info(f"[Eagle3 Patch] hidden_states shape: {len(hidden_states) if hidden_states else 'None'}")
+            else:
+                logger.warning(f"[Eagle3 Patch] hidden_states is None! rollout id {rollout_id}")
+                return 
+
+            # Collect data
+            logger.info(f"[Eagle3 Patch] Collecting rollout data for Eagle3...")
+            eagle3_manager.collect_rollout_data(rollout_data, hidden_states)
+            logger.info(f"[Eagle3 Patch] Data collection completed")
+
+            # Train drafter - use asyncio.run to run async function
+            logger.info(f"[Eagle3 Patch] Starting Eagle3 drafter training...")
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(eagle3_manager.train_drafter(rollout_id))
+            finally:
+                loop.close()
+            logger.info(f"[Eagle3 Patch] Eagle3 drafter training completed")
+        else:
+            logger.warning(f"[Eagle3 Patch] eagle3_manager is not initialized, skipping Eagle3 training")
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
@@ -388,7 +434,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         )
 
-        if rollout_id >= self.args.num_critic_only_steps and not self.args.critic_train_only:
+        if rollout_id >= self.args.num_critic_only_steps:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
 
         compute_advantages_and_returns(self.args, rollout_data)
@@ -423,20 +469,6 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
-
-                # Forward teacher model to get teacher_log_probs for Megatron-based OPD
-                if "teacher" in self.weights_backuper.backup_tags:
-                    if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("teacher")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="teacher_",
-                        )
-                    )
-
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -468,13 +500,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
-                self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
+                self.rollout_data_postprocess(self.args)
 
-            log_rollout_data(
-                rollout_id,
-                self.args,
-                rollout_data,
-            )
+            log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
             if self.args.use_routing_replay:
@@ -546,26 +574,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.recover_updatable_engines.remote())
+                ray.get(self.rollout_manager.recover_rollout_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_updatable_engines_and_lock.remote()
+        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+            self.rollout_manager.get_rollout_engines_and_lock.remote()
         )
 
         if self.args.offload_train:
             reload_process_groups()
-
+        
+        print("############actor######update_weights###########")
         if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(
-                rollout_engines,
-                rollout_engine_lock,
-                engine_gpu_counts=engine_gpu_counts,
-                engine_gpu_offsets=engine_gpu_offsets,
-            )
+            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
+                ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
@@ -590,6 +614,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+        
+        # if self.eagle3_manager.is_initialized:
+        #     eagle3_manager = self.eagle3_manager
+            
+        #     # Run async update
+        #     loop = asyncio.new_event_loop()
+        #     asyncio.set_event_loop(loop)
+        #     try:
+        #         loop.run_until_complete(eagle3_manager.update_drafter_weights())
+        #     finally:
+        #         loop.close()
 
         if self.args.offload_train:
             destroy_process_groups()
@@ -601,13 +636,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self.args.no_load_rng = True
         self.args.finetune = True
 
-        old_ckpt_step = None
         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
             old_ckpt_step = self.args.ckpt_step
             self.args.ckpt_step = self.args.ref_ckpt_step
-        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
 
         _, _ = load_checkpoint(
             self.model,
@@ -618,7 +649,7 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
 
-        if old_ckpt_step is not None:
+        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
             self.args.ckpt_step = old_ckpt_step
 
         self.weights_backuper.backup(model_tag)
@@ -639,8 +670,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         group_name = "actor_critic"
         world_size = 2
+        if is_npu():
+            backend = "hccl"
+        else:
+            backend = "nccl"
         self._actor_critic_groups = init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,
             rank=0 if self.role == "actor" else 1,

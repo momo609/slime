@@ -4,7 +4,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any,Optional
 
 import torch
 from examples.geo3k_vlm_multi_turn.base_env import BaseInteractionEnv
@@ -22,7 +22,10 @@ DUMMY_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "I am a user."},
 ]
-
+import logging
+import os
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("SLIME_LOGGING_LEVEL", "INFO"))
 
 def _load_env_module(env_path: str | None):
     """Load the interaction environment module from a module path or a file path."""
@@ -188,25 +191,189 @@ def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict
         budget = sampling_params["max_new_tokens"] - len(sample.tokens)
     return current_image_data, response_tokens, budget, multimodal_train_inputs_buffer
 
+def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    dense_logprob_view = torch.full(
+        (logprobs.size(0), vocab_size),
+        float("-inf"),
+        dtype=logprobs.dtype,
+        device=logprobs.device,
+    )
+    if logprobs.numel() == 0:
+        return dense_logprob_view
 
-async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer):
-    payload = {
-        "input_ids": tokens,
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-    }
-    if image_data:
-        payload["image_data"] = image_data
+    valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
+    if not valid.any():
+        return dense_logprob_view
 
-    output = await post(url, payload)
-    response_text = output["text"]
-    if "output_token_logprobs" in output["meta_info"]:
-        new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        new_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    valid_count = valid.sum(dim=-1)
+    has_valid = valid_count > 0
+    # print("###########logprobs",logprobs)
+    # print("###########valid",valid)
+    topk_mass = torch.where(valid, logprobs.float().exp(), torch.zeros_like(logprobs, dtype=torch.float32)).sum(dim=-1)
+    print("###########topk_mass",torch.where(valid, logprobs.float().exp(), torch.zeros_like(logprobs, dtype=torch.float32)).shape)
+    remaining_mass = (1.0 - topk_mass).clamp(min=torch.finfo(torch.float32).tiny)
+    print("###########remaining_mass",remaining_mass.shape)
+    remaining_count = (vocab_size - valid_count).clamp(min=1).to(torch.float32)
+    tail_logprob = (remaining_mass.log() - remaining_count.log()).to(logprobs.dtype)
+    print("###########tail_logprob",tail_logprob.shape)
+    dense_logprob_view = torch.where(
+        has_valid.unsqueeze(-1),
+        tail_logprob.unsqueeze(-1).expand(-1, vocab_size),
+        dense_logprob_view,
+    )
+
+    row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
+    dense_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
+    print("###########dense_logprob_view",dense_logprob_view.shape)
+    return dense_logprob_view
+
+import math
+def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
+    if topk <= 0:
+        return None
+
+    rows = []
+    for step_top_logprobs in top_logprobs:
+        if isinstance(step_top_logprobs, dict):
+            entries = list(step_top_logprobs.values())
+        else:
+            entries = list(step_top_logprobs or [])
+
+        row = []
+        for entry in entries[:topk]:
+            if isinstance(entry, dict):
+                logprob = entry.get("logprob", entry.get("log_probs", entry.get("log_prob")))
+                token_id = entry.get("token_id", entry.get("idx", entry.get("id")))
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                logprob, token_id = entry[0], entry[1]
+            else:
+                continue
+
+            try:
+                row.append([float(logprob), float(int(token_id))])
+            except (TypeError, ValueError):
+                continue
+
+        if not row:
+            row = [[-math.inf, -1.0] for _ in range(topk)]
+        while len(row) < topk:
+            row.append([-math.inf, -1.0])
+        rows.append(row)
+
+    if not rows:
+        return None
+    return torch.tensor(rows, dtype=torch.float32)
+
+def _response_aligned_top_logprobs_to_tensor(
+    prompt_len: int,
+    output_top_logprobs: list,
+    topk: int,
+) -> torch.Tensor:
+    if not output_top_logprobs:
+        return None
+
+    # Drafter loss is response-only. Some SGLang GPU speculative paths may
+    # return partial input_top_logprobs, so keep prompt target rows as masked
+    # placeholders and align finite rows only from generated response tokens.
+    prompt_target_padding = [[] for _ in range(max(int(prompt_len) - 1, 0))]
+    return _top_logprobs_to_tensor(prompt_target_padding + output_top_logprobs, topk)
+
+def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
+    if topk <= 0:
+        raise ValueError(f"topk must be positive when reconstructing dense logprob view, got {topk}")
+    if target_topk_logprobs.dim() != 3 or target_topk_logprobs.size(-1) < 2:
+        raise ValueError(
+            "target_topk_logprobs must have shape [seq, topk, 2+] when reconstructing a dense logprob view, "
+            f"but got shape={tuple(target_topk_logprobs.shape)}"
+        )
+    if target_topk_logprobs.numel() == 0:
+        return torch.full(
+            (
+                target_topk_logprobs.shape[0],
+                vocab_size,
+            ),
+            float("-inf"),
+            dtype=target_topk_logprobs.dtype,
+            device=target_topk_logprobs.device,
+        )
+    logprobs = target_topk_logprobs[..., 0]
+    indices = target_topk_logprobs[..., 1].to(torch.long)
+    return _scatter_topk_logprobs_with_tail(logprobs, indices, vocab_size)
+
+async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, rollout_id):
+    if rollout_id % 10 == 0:
+        payload = {
+            "input_ids": tokens,
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "return_hidden_states": True,
+            "top_logprobs_num": 128,
+            "logprob_start_len": 0,
+        }
+        if image_data:
+            payload["image_data"] = image_data
+
+        output = await post(url, payload)
+        response_text = output["text"]
+        if "output_token_logprobs" in output["meta_info"]:
+            new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            new_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        else:
+            new_tokens, new_log_probs = [], []
+        finish_type = output["meta_info"]["finish_reason"]["type"]
+        hs_data = output["meta_info"]["hidden_states"]
+        hidden_states_list = []
+        for i in range(len(hs_data)):
+            # Convert hidden states to tensors
+            h_state = torch.tensor(hs_data[i], dtype=torch.bfloat16)
+            # Skip empty tensors
+            if h_state.numel() == 0:
+                continue
+            # Ensure proper dimensions [1, hidden_dim] or [seq_len, hidden_dim]
+            if h_state.dim() == 1:
+                h_state = h_state.unsqueeze(0)
+            elif h_state.dim() == 3:
+                h_state = h_state.squeeze(0)
+            hidden_states_list.append(h_state)
+            # Concatenate non-empty tensors
+        if hidden_states_list:
+            hidden_states = torch.cat(hidden_states_list, dim=0)
+            print(f"########hidden_state_shape: {hidden_states.shape}")
+            engine_hidden_states = hidden_states
+        output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
+        # print("############output_top",output_top)
+        target_logprobs = _response_aligned_top_logprobs_to_tensor(
+            prompt_len=len(tokens),
+            output_top_logprobs=output_top,
+            topk=128,
+        )
+        if target_logprobs is None:
+            logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
+        target_scores = reconstruct_dense_logprob_view(
+                            target_logprobs.squeeze(0),
+                            topk=128,
+                            vocab_size=32000,
+                        ).unsqueeze(0)
     else:
-        new_tokens, new_log_probs = [], []
-    finish_type = output["meta_info"]["finish_reason"]["type"]
-    return response_text, new_tokens, new_log_probs, finish_type
+        payload = {
+            "input_ids": tokens,
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+        }
+        if image_data:
+            payload["image_data"] = image_data
+
+        output = await post(url, payload)
+        response_text = output["text"]
+        if "output_token_logprobs" in output["meta_info"]:
+            new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            new_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        else:
+            new_tokens, new_log_probs = [], []
+        finish_type = output["meta_info"]["finish_reason"]["type"]
+        engine_hidden_states = None
+        target_scores = None
+    return response_text, new_tokens, new_log_probs, finish_type, engine_hidden_states, target_scores
 
 
 def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
@@ -306,7 +473,7 @@ def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_trai
     return sample
 
 
-async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
+async def generate(args: Any, sample: Sample, sampling_params, rollout_id: int) -> Sample:
     """Custom multi-turn rollout that interacts with a pluggable environment."""
     assert not args.partial_rollout, "Partial rollout is not supported for interaction rollouts."
 
@@ -326,10 +493,13 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if budget is not None:
                 cur_sampling_params["max_new_tokens"] = budget
 
-            response_text, new_response_tokens, new_response_log_probs, finish_type = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer
+            response_text, new_response_tokens, new_response_log_probs, finish_type, engine_hidden_states, target_scores = await _run_inference_step(
+                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, rollout_id=rollout_id
             )
             _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
+            sample.hidden_states = engine_hidden_states
+            sample.target_scores = target_scores
+            # print("###############sample.hidden_states########")
             budget = _update_budget(budget, len(new_response_tokens))
 
             if _should_stop_on_finish(sample, finish_type):

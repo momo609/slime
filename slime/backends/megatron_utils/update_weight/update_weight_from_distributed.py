@@ -12,10 +12,68 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
+from slime.utils.common import is_npu
 
-from ..megatron_to_hf import convert_to_hf
+from ..megatron_to_hf import convert_to_hf, postprocess_hf_param
 from .common import all_gather_param, named_params_and_buffers
 
+import os
+def load_eagle3_update_weight_checkpoint(
+    model,
+    checkpoint_path: str,
+):
+    """Load Eagle3 drafter model from checkpoint.
+    
+    Args:
+        model: Eagle3 drafter model
+        checkpoint_path: Path to checkpoint directory or file
+    """
+    print("#####################load_eagle3_update_weight_checkpoint")
+    if os.path.isfile(checkpoint_path):
+        # Single file checkpoint
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+    elif os.path.isdir(checkpoint_path):
+        # Directory checkpoint
+        checkpoint_file = os.path.join(checkpoint_path, "trainer_state.pt")
+        if os.path.exists(checkpoint_file):
+            state_dict = torch.load(checkpoint_file, map_location="cpu")
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+        else:
+            # Try loading from HuggingFace format
+            from safetensors.torch import load_file
+            
+            safetensors_files = [f for f in os.listdir(checkpoint_path) if f.endswith('.safetensors')]
+            if safetensors_files:
+                state_dict = {}
+                for f in safetensors_files:
+                    state_dict.update(load_file(os.path.join(checkpoint_path, f)))
+            else:
+                # Try .bin files
+                bin_files = [f for f in os.listdir(checkpoint_path) if f.endswith('.bin')]
+                if bin_files:
+                    state_dict = {}
+                    for f in bin_files:
+                        checkpoint = torch.load(os.path.join(checkpoint_path, f), map_location="cpu")
+                        state_dict.update(checkpoint)
+                else:
+                    raise FileNotFoundError(f"No checkpoint files found in {checkpoint_path}")
+    else:
+        raise FileNotFoundError(f"Checkpoint path not found: {checkpoint_path}")
+    
+    # Rename keys if necessary
+    renamed_checkpoint = {}
+    for key, value in state_dict.items():
+        renamed_checkpoint[key] = value
+    # Load state dict with strict=False to allow partial loading
+    missing_keys, unexpected_keys = model.load_state_dict(renamed_checkpoint, strict=False)
+    print("#####################update weight missingkey ",missing_keys)
+    print("#####################update weight unexpected_keys ",unexpected_keys)
+    
+    # Load vocabulary mapping (t2d/d2t) if available in checkpoint
+    if hasattr(model, "load_vocab_mapping"):
+        model.load_vocab_mapping(renamed_checkpoint)
+    
 
 class UpdateWeightFromDistributed:
     """
@@ -31,6 +89,7 @@ class UpdateWeightFromDistributed:
         *,
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
+        eagle3_manager : None,
     ) -> None:
         """
         Initialize. Groups created in connect_rollout_engines.
@@ -41,20 +100,16 @@ class UpdateWeightFromDistributed:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self._model_update_groups = None
+        self.eagle3_manager = eagle3_manager
 
     def connect_rollout_engines(
-        self,
-        rollout_engines: Sequence[ActorHandle],
-        rollout_engine_lock: ActorHandle,
-        engine_gpu_counts: Sequence[int] | None = None,
-        engine_gpu_offsets: Sequence[int] | None = None,
+        self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
     ) -> None:
         """
         Create NCCL "slime-pp_{pp_rank}" if PP source (DP=TP=0). Lock prevents concurrent broadcasts.
         """
         self.rollout_engines = rollout_engines
         self.rollout_engine_lock = rollout_engine_lock
-        self._engine_gpu_counts = engine_gpu_counts
 
         # For TP:
         #   1. AllGather parameters to rank 0
@@ -72,10 +127,7 @@ class UpdateWeightFromDistributed:
                     self.args, self._group_name, self._model_update_groups, self.rollout_engines
                 )
             self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.args,
-                self._group_name,
-                rollout_engines,
-                engine_gpu_counts=engine_gpu_counts,
+                self.args, self._group_name, rollout_engines
             )
 
     @torch.no_grad()
@@ -83,6 +135,7 @@ class UpdateWeightFromDistributed:
         """
         Pause → flush → non-expert (TP) → expert (EP) → continue. Progress on PP source.
         """
+        print("#########megatron##########update_weights######")
         self.weight_version += 1
 
         if dist.get_rank() == 0:
@@ -98,6 +151,37 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
+        if getattr(self.args, "megatron_to_hf_mode", "raw") == "bridge":
+            print("#########megatron##########_update_weights_with_bridge######")
+            self._update_weights_with_bridge()
+        else:
+            print("#########megatron##########_update_weights_raw######")
+            self._update_weights_raw()
+
+        dist.barrier(group=get_gloo_group())
+        
+        self._update_draft_weight()
+        
+        dist.barrier(group=get_gloo_group())
+        
+        if dist.get_rank() == 0:
+            # int4/fp4 post_process
+            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                post_process_weights(
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                    rollout_engines=self.rollout_engines,
+                )
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+        
+        
+
+    def _update_weights_raw(self) -> None:
+        """
+        manual TP gather + convert_to_hf.
+        Non-expert (TP) → expert (EP) separately.
+        """
         buffer_size = 0
         converted_named_tensors = []
         # non expert params
@@ -127,17 +211,68 @@ class UpdateWeightFromDistributed:
         if named_tensors:
             self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
 
-        dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
-            # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+    def _update_weights_with_bridge(self) -> None:
+        """
+        Bridge mode: let Bridge handle PP/TP/EP gather + conversion.
+        Only PP source rank (DP=TP=0) broadcasts to rollout engines.
+        """
+        from slime.utils import megatron_bridge_utils
+
+        pbar = tqdm(desc=f"[{self._group_name}] Update weights (bridge)") if self._is_pp_src_rank else None
+
+        buffer_size = 0
+        converted_named_tensors = []
+        bridge = megatron_bridge_utils.get_bridge(self.args.hf_checkpoint)
+        with megatron_bridge_utils.patch_megatron_model(self.model):
+            # Iterate through weights - all ranks participate in each iteration
+            for hf_name, tensor, megatron_name in bridge.export_hf_weights(
+                self.model,
+                cpu=False,
+                show_progress=False,
+            ):
+                # Only PP source rank accumulates and broadcasts
+                if not self._is_pp_src_rank:
+                    continue
+
+                tensor = postprocess_hf_param(
+                    args=self.args,
+                    megatron_param_name=megatron_name,
+                    hf_param_name=hf_name,
+                    param=tensor,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
+
+                tensor_size = tensor.numel() * tensor.element_size()
+
+                if buffer_size + tensor_size > self.args.update_weight_buffer_size and converted_named_tensors:
+                    self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+                    converted_named_tensors = []
+                    buffer_size = 0
+
+                converted_named_tensors.append((hf_name, tensor))
+                buffer_size += tensor_size
+
+        if self._is_pp_src_rank and converted_named_tensors:
+            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+
+        return converted_named_tensors
+    
+    def _update_draft_weight(self) -> None:
+        pbar2 = tqdm(desc=f"[{self._group_name}] Update weights (draft)") if self._is_pp_src_rank else None
+        draft_model = self.eagle3_manager.drafter_model
+        load_eagle3_update_weight_checkpoint(draft_model, "/home/vllm/w00664509/qwen3-eagle/eagle3_step_0/")
+        state_dict = draft_model.module.state_dict() if hasattr(draft_model, 'module') else draft_model.state_dict()
+    
+        converted_named_tensors = []
+        for megatron_name, tensor in state_dict.items():
+            hf_name = megatron_name
+            
+            if hf_name.startswith('module.'):
+                hf_name = hf_name[7:]
+            if hf_name.startswith('model.'):
+                hf_name = hf_name[6:] 
+            converted_named_tensors.append((hf_name, tensor))
+        if self._is_pp_src_rank and converted_named_tensors:
+            self._update_draft_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar2)
 
     def _update_weight_from_distributed(
         self,
@@ -234,8 +369,29 @@ class UpdateWeightFromDistributed:
         # lock the rollout engines to prevent dead lock on broadcast.
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
-
         refs = update_weights_from_distributed(
+            self._group_name,
+            self._model_update_groups,
+            self.weight_version,
+            self.rollout_engines,
+            converted_named_tensors,
+        )
+        
+        ray.get(refs)
+        converted_named_tensors.clear()
+        ray.get(self.rollout_engine_lock.release.remote())
+        pbar.update(1)
+    
+    def _update_draft_bucket_weights_from_distributed(
+        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
+    ) -> None:
+        """
+        Lock → broadcast → clear → unlock → pbar++. Lock prevents NCCL deadlock.
+        """
+        # lock the rollout engines to prevent dead lock on broadcast.
+        while not ray.get(self.rollout_engine_lock.acquire.remote()):
+            time.sleep(0.1)
+        refs = update_weights_from_disk(
             self._group_name,
             self._model_update_groups,
             self.weight_version,
@@ -249,46 +405,33 @@ class UpdateWeightFromDistributed:
         pbar.update(1)
 
 
+
 def connect_rollout_engines_from_distributed(
-    args: Namespace,
-    group_name: str,
-    rollout_engines: Sequence[ActorHandle],
-    engine_gpu_counts: Sequence[int] | None = None,
+    args: Namespace, group_name: str, rollout_engines: Sequence[ActorHandle]
 ) -> dist.ProcessGroup:
     """
     Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
-
-    ``engine_gpu_counts`` gives the number of GPUs per engine.  When engines
-    have heterogeneous TP sizes (e.g. prefill TP=2, decode TP=4), each engine
-    occupies a different number of ranks in the NCCL group.
     """
-    if engine_gpu_counts is None:
-        engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
-
     master_address = ray._private.services.get_node_ip_address()
     with socket.socket() as sock:
         sock.bind(("", 0))
         master_port = sock.getsockname()[1]
-    world_size = sum(engine_gpu_counts) + 1  # +1 for training rank 0
+    world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + 1
 
-    # Compute cumulative rank offsets: engine i starts at cumulative[i] + 1.
-    cumulative = [0]
-    for c in engine_gpu_counts:
-        cumulative.append(cumulative[-1] + c)
-
+    backend = "hccl" if is_npu() else "nccl"
     refs = [
         engine.init_weights_update_group.remote(
-            master_address=master_address,
-            master_port=master_port,
-            rank_offset=cumulative[i] + 1,
-            world_size=world_size,
-            group_name=group_name,
-            backend="nccl",
+            master_address,
+            master_port,
+            i * args.rollout_num_gpus_per_engine + 1,
+            world_size,
+            group_name,
+            backend=backend,
         )
         for i, engine in enumerate(rollout_engines)
     ]
     model_update_groups = init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method=f"tcp://{master_address}:{master_port}",
         world_size=world_size,
         rank=0,
@@ -307,6 +450,27 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
     ray.get(refs)
 
 
+def update_weights_from_disk(
+    group_name: str,
+    group: dist.ProcessGroup,
+    weight_version: int,
+    rollout_engines: Sequence[ActorHandle],
+    converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+) -> list[ObjectRef]:
+    """
+    Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
+    """
+    # print("############megatron#########engine",rollout_engines[0].get_tp_worker() )
+    # print("############megatron#########engine222",rollout_engines[0].get_tp_worker().draft_worker )
+    refs = [
+        engine.update_weights_from_disk.remote(
+            model_path="/home/vllm/w00664509/qwen3-eagle/eagle3_step_0/",
+        )
+        for engine in rollout_engines
+    ]
+
+    return refs
+
 def update_weights_from_distributed(
     group_name: str,
     group: dist.ProcessGroup,
@@ -317,6 +481,8 @@ def update_weights_from_distributed(
     """
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
     """
+    # print("############megatron#########engine",rollout_engines[0].get_tp_worker() )
+    # print("############megatron#########engine222",rollout_engines[0].get_tp_worker().draft_worker )
     refs = [
         engine.update_weights_from_distributed.remote(
             names=[name for name, _ in converted_named_tensors],
