@@ -2,7 +2,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import torch
+from torch import Tensor, nn
 
 
 @dataclass
@@ -27,6 +29,8 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    hidden_states: list[Tensor] | None = None  # Hidden states from rollout engine for Eagle3 training
+    target_logprobs: Tensor | None = None  # Dense logprob tensor [seq_len, vocab_size] reconstructed from topk for Eagle3 training
 
     class Status(Enum):
         PENDING = "pending"

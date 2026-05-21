@@ -81,11 +81,10 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
         import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
+        from slime.utils.megatron_bridge_utils import get_bridge
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        bridge = get_bridge(args.hf_checkpoint)
         provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
@@ -101,6 +100,23 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+
+        # Recompute settings - enable these if memory is insufficient
+        provider.recompute_granularity = args.recompute_granularity
+        provider.recompute_method = args.recompute_method
+        provider.recompute_num_layers = args.recompute_num_layers
+        # Other arguments
+        provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        provider.moe_permute_fusion = args.moe_permute_fusion
+        provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+        provider.freeze_language_model = False
+        provider.freeze_vision_model = False
+
+        for key, value in vars(args).items():
+            if hasattr(provider, key):
+                continue
+            setattr(provider, key, value)
+            
         provider.finalize()
 
         if role == "critic":

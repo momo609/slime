@@ -1,0 +1,129 @@
+diff a/slime/utils/arguments.py b/slime/utils/arguments.py	(rejected hunks)
+@@ -1383,73 +1566,82 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+             help="Path to the YAML config for custom function arguments.",
+         )
+         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
+-
++        
++        parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
+         return parser
+ 
+     return add_slime_arguments
+ 
+ 
+-def _pre_parse_mode():
+-    """Pre-parse CLI to extract arguments that control parsing flow.
+-
+-    These arguments are removed from add_slime_arguments to avoid
+-    registering them twice.  The returned namespace is merged into
+-    the final ``args`` after Phase 2 parsing.
+-    """
+-    temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
+-    temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
+-    temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
+-    temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+-    temp_args, _ = temp_parser.parse_known_args()
+-    return temp_args
+-
+-
+ def parse_args(add_custom_arguments=None):
+     # Users may call `parse_args` very early, thus we ensure logger is configured here
+     configure_logger()
+ 
+     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
+ 
+-    pre = _pre_parse_mode()
+-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
+-
+-    # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
+-    # Skipped when sglang servers are not needed.
+-    sglang_ns = None
+-    if not skip_sglang:
+-        sglang_ns = sglang_parse_args()
+-
+-    # Phase 2: Parse megatron + slime args.
+-    # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
+-    # are silently ignored by the megatron parser.
+-    from slime.backends.megatron_utils.arguments import megatron_parse_args
++    from slime.backends.megatron_utils.arguments import parse_args as megatron_parse_args
++    from slime.backends.megatron_utils.arguments import set_default_megatron_args
+     from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
+ 
+-    args = megatron_parse_args(
+-        extra_args_provider=add_slime_arguments,
+-        skip_hf_validate=pre.debug_rollout_only,
+-    )
++    args = megatron_parse_args(extra_args_provider=add_slime_arguments)
++    if args.hf_checkpoint and not args.debug_rollout_only:
++        hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
++        hf_validate_args(args, hf_config)
+ 
+-    # Merge pre-parsed args into the main namespace
+-    for key, value in vars(pre).items():
+-        setattr(args, key, value)
+ 
+-    # Merge sglang args into the main namespace
+-    if sglang_ns is not None:
+-        for key, value in vars(sglang_ns).items():
+-            setattr(args, key, value)
++    args.rank = 0
++    args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
++    args = set_default_megatron_args(args)
+ 
+     slime_validate_args(args)
+ 
+-    if pre.train_backend == "megatron" and not args.debug_rollout_only:
+-        megatron_validate_args(args)
++    megatron_validate_args(args)
+ 
+-    if not args.debug_train_only:
+-        sglang_validate_args(args)
++    # always use varlen
++    args.variable_seq_lengths = True
++    if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
++        logger.info(
++            "--moe-token-dispatcher-type allgather does not support variable sequence length, "
++            "please use alltoall dispatcher instead."
++        )
++        args.moe_token_dispatcher_type = "alltoall"
++
++    if args.pipeline_model_parallel_size == 1:
++        assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, (
++            "decoder_first_pipeline_num_layers and decoder_last_pipeline_num_layers should be None when "
++            "pipeline_model_parallel_size is 1."
++        )
++
++    sglang_validate_args(args)
+ 
+     return args
+ 
++def hf_validate_args(args, hf_config):
++    def equal(x, y):
++        return x == y
++
++    errors = []
++
++    # multimodal models have different config structure
++    if hasattr(hf_config, "text_config"):
++        hf_config = hf_config.text_config
++
++    for hf_config_name, megatron_config_name, compare_fn in [
++        ("hidden_size", "hidden_size", equal),
++        ("num_attention_heads", "num_attention_heads", equal),
++        ("num_hidden_layers", "num_layers", equal),
++        ("intermediate_size", "ffn_hidden_size", equal),
++        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
++        ("rms_norm_eps", "norm_epsilon", equal),
++        ("rope_theta", "rotary_base", equal),
++    ]:
++        if hasattr(hf_config, hf_config_name):
++            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
++                errors.append(
++                    f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
++                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
++                )
++    
+  def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
+      """
+      Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.

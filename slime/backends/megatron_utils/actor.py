@@ -25,6 +25,7 @@ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
+from slime.utils.common import is_npu
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
@@ -52,10 +53,6 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
-        if args.debug_rollout_only:
-            self.args = args
-            return 0
-
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
 
@@ -72,6 +69,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
+        self.args.pad_token_id = self.tokenizer.pad_token_id
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -83,6 +81,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
+        if self.args.debug_rollout_only:
+            return 0
+        
         if role == "critic":
             self.args.load = self.args.critic_load
             self.args.save = self.args.critic_save
@@ -156,6 +157,10 @@ class MegatronTrainRayActor(TrainRayActor):
             from slime.utils.misc import load_function
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+        
+        if hasattr(self.args, 'enable_eagle3_training') and self.args.enable_eagle3_training:
+            from slime.backends.megatron_utils.eagle3_actor_patch import apply_eagle3_patches_if_enabled
+            apply_eagle3_patches_if_enabled(self)
 
         self.prof.on_init_end()
 
@@ -361,19 +366,68 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
-        if self.args.debug_rollout_only:
-            return
-
         if self.args.offload_train:
             self.wake_up()
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
+            if self.args.debug_rollout_only:
+                log_rollout_data(rollout_id, self.args, rollout_data)
+                return
 
+        # if self.role == "critic":
+        #     return self.train_critic(rollout_id, rollout_data)
+        # else:
+        #     return self.train_actor(rollout_id, rollout_data)
+        
         if self.role == "critic":
-            return self.train_critic(rollout_id, rollout_data)
+            self.train_critic(rollout_id, rollout_data)
         else:
-            return self.train_actor(rollout_id, rollout_data)
+            self.train_actor(rollout_id, rollout_data)
+        
+        logger.info(f"[Eagle3 Patch] Original train completed for rollout_id={rollout_id}")
+
+        # Train Eagle3 drafter if enabled
+        if hasattr(self, 'eagle3_manager'):
+            logger.info(f"[Eagle3 Patch] eagle3_manager exists: {self.eagle3_manager}")
+            logger.info(f"[Eagle3 Patch] eagle3_manager.is_initialized: {self.eagle3_manager.is_initialized}")
+        else:
+            logger.warning(f"[Eagle3 Patch] eagle3_manager does not exist!")
+            return
+
+        if self.eagle3_manager.is_initialized:
+            eagle3_manager = self.eagle3_manager
+
+            # Collect rollout data for Eagle3 training
+            rollout_data = self._get_rollout_data(rollout_data_ref)
+            logger.info(f"[Eagle3 Patch] rollout_data keys: {rollout_data.keys()}")
+            logger.info(f"[Eagle3 Patch] rollout_data num_samples: {len(rollout_data.get('tokens', []))}")
+
+            # Extract hidden states if available
+            hidden_states = rollout_data.get('hidden_states', None)
+            target_logprobs = rollout_data.get('target_logprobs', None)
+            logger.info(f"[Eagle3 Patch] hidden_states available: {hidden_states is not None}")
+            logger.info(f"[Eagle3 Patch] target_logprobs available: {target_logprobs is not None}")
+            if hidden_states is not None:
+                logger.info(f"[Eagle3 Patch] hidden_states shape: {len(hidden_states) if hidden_states else 'None'}")
+
+            # Collect data
+            logger.info(f"[Eagle3 Patch] Collecting rollout data for Eagle3...")
+            eagle3_manager.collect_rollout_data(rollout_data, hidden_states, target_logprobs)
+            logger.info(f"[Eagle3 Patch] Data collection completed")
+
+            # Train drafter - use asyncio.run to run async function
+            logger.info(f"[Eagle3 Patch] Starting Eagle3 drafter training...")
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(eagle3_manager.train_drafter(rollout_id))
+            finally:
+                loop.close()
+            logger.info(f"[Eagle3 Patch] Eagle3 drafter training completed")
+        else:
+            logger.warning(f"[Eagle3 Patch] eagle3_manager is not initialized, skipping Eagle3 training")
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
@@ -639,8 +693,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         group_name = "actor_critic"
         world_size = 2
+        if is_npu():
+            backend = "hccl"
+        else:
+            backend = "nccl"
         self._actor_critic_groups = init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,
             rank=0 if self.role == "actor" else 1,

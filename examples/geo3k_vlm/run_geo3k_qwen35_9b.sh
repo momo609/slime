@@ -13,9 +13,8 @@
 
 # Configuration
 TRAIN_BACKEND="megatron"
-MODEL_NAME="Qwen3_5-35B-A3B"
+MODEL_NAME="Qwen3_5-9B"
 DATASET_NAME=${SLIME_SCRIPT_DATASET_NAME:-"chenhegu/geo3k_imgurl"}
-NUM_GPUS=${SLIME_SCRIPT_NUM_GPUS:-8}
 DATASET_LOCAL_NAME=$(basename "$DATASET_NAME")
 
 MODEL_NAME_LOWER=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
@@ -73,24 +72,6 @@ export GLOO_SOCKET_IFNAME=lo
 # export ASCEND_LAUNCH_BLOCKING=1
 export DISABLE_L2_CACHE=1
 
-# Detect NVLink
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-   HAS_NVLINK=1
-else
-   HAS_NVLINK=0
-fi
-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
-
-# Download model and dataset
-# mkdir -p /root/models /root/datasets
-# if [ ! -d "/root/models/${MODEL_NAME}" ]; then
-#    hf download Qwen/${MODEL_NAME} --local-dir /root/models/${MODEL_NAME}
-# fi
-# if [ ! -d "/root/datasets/${DATASET_LOCAL_NAME}" ]; then
-#    hf download --repo-type dataset ${DATASET_NAME} --local-dir /root/datasets/${DATASET_LOCAL_NAME}
-# fi
-
 # Common args
 CKPT_ARGS=(
    --hf-checkpoint /home/data/${MODEL_NAME}
@@ -106,11 +87,11 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 3000
-   --rollout-batch-size 64
+   --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 4096
    --rollout-temperature 0.8
-   --global-batch-size 512
+   --global-batch-size 256
 )
 
 # required for vlm datasets
@@ -147,11 +128,11 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.7
    # --sglang-ep-size 4
-   --sglang-cuda-graph-bs 16
-   # --sglang-disable-cuda-graph
+   --sglang-cuda-graph-bs 4 8 16 24 32 40 48 56 64 72
+   --sglang-disable-cuda-graph
 
    # MTP speculative decoding
    # --sglang-speculative-algorithm EAGLE
@@ -164,7 +145,6 @@ SGLANG_ARGS=(
    --sglang-attention-backend ascend
    --sglang-device npu
    --sglang-disable-radix-cache
-   --sglang-trust-remote-code
    --sglang-enable-multimodal
    --sglang-mm-attention-backend ascend_attn
    --sglang-dtype bfloat16
@@ -173,6 +153,7 @@ SGLANG_ARGS=(
    --sglang-max-total-tokens 327680
    # --sglang-node-rank 0
    # --sglang-nnodes 1
+   --num-gpus-per-node 16
 )
 
 # Wandb args (only if WANDB_API_KEY is set)
@@ -190,18 +171,23 @@ fi
 
 MISC_ARGS=(
    # --colocate
+   --use-flash-attn
+   # --debug-rollout-only
+   # --debug-train-only
+   # --load-debug-rollout-data /home/c00944022/slime-proj/debug/data_{rollout_id}.pt
+   --no-check-for-nan-in-loss-and-grad
 )
 
 # Backend-specific args
 # megatron backend
 BACKEND_ARGS=(
    --train-backend megatron
-   # Qwen3.5-35B-A3B has num_query_groups = 2
-   --tensor-model-parallel-size 2
+   # Qwen3.5-9B has num_query_groups = 4
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
+   --pipeline-model-parallel-size 4
    --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
@@ -218,7 +204,7 @@ BACKEND_ARGS=(
 )
 
 SLIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
-source "${SLIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"
+source "${SLIME_DIR}/scripts/models/qwen3.5-9B.sh"
 
 # Start Ray if not using external Ray
 if [ "$USE_EXTERNAL_RAY" = "0" ]; then
@@ -244,8 +230,9 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 8 \
-   --rollout-num-gpus 8 \
+   --actor-num-gpus-per-node 16 \
+   --rollout-num-gpus 16 \
+   --colocate \
    --multimodal-keys "${MULTIMODAL_KEYS}" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

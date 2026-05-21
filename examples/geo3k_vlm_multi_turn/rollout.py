@@ -24,6 +24,79 @@ DUMMY_MESSAGES = [
 ]
 
 
+def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    dense_logprob_view = torch.full(
+        (logprobs.size(0), vocab_size),
+        float("-inf"),
+        dtype=logprobs.dtype,
+        device=logprobs.device,
+    )
+    if logprobs.numel() == 0:
+        return dense_logprob_view
+
+    valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
+    if not valid.any():
+        return dense_logprob_view
+
+    valid_count = valid.sum(dim=-1)
+    has_valid = valid_count > 0
+    topk_mass = torch.where(
+        valid, logprobs.float().exp(), torch.zeros_like(logprobs, dtype=torch.float32)
+    ).sum(dim=-1)
+    remaining_mass = (1.0 - topk_mass).clamp(min=torch.finfo(torch.float32).tiny)
+    remaining_count = (vocab_size - valid_count).clamp(min=1).to(torch.float32)
+    tail_logprob = (remaining_mass.log() - remaining_count.log()).to(logprobs.dtype)
+    dense_logprob_view = torch.where(
+        has_valid.unsqueeze(-1),
+        tail_logprob.unsqueeze(-1).expand(-1, vocab_size),
+        dense_logprob_view,
+    )
+
+    row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
+    dense_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
+    return dense_logprob_view
+
+
+def _extract_and_reconstruct_topk_logprobs(
+    output_token_logprobs: list, meta_info: dict, vocab_size: int
+) -> torch.Tensor | None:
+    if not output_token_logprobs:
+        return None
+
+    topk_logprobs_list = []
+    topk_indices_list = []
+
+    for item in output_token_logprobs:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        topk = item[2]
+        if not isinstance(topk, (list, tuple)) or len(topk) == 0:
+            continue
+        topk_vals = [p[0] for p in topk if isinstance(p, (list, tuple)) and len(p) >= 2]
+        topk_ids = [p[1] for p in topk if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if not topk_vals:
+            continue
+        topk_logprobs_list.append(topk_vals)
+        topk_indices_list.append(topk_ids)
+
+    if not topk_logprobs_list:
+        return None
+
+    max_topk = max(len(vals) for vals in topk_logprobs_list)
+    padded_logprobs = [
+        vals + [float("-inf")] * (max_topk - len(vals)) for vals in topk_logprobs_list
+    ]
+    padded_indices = [
+        idxs + [-1] * (max_topk - len(idxs)) for idxs in topk_indices_list
+    ]
+
+    device = torch.device("cpu")
+    logprobs_tensor = torch.tensor(padded_logprobs, dtype=torch.float32, device=device)
+    indices_tensor = torch.tensor(padded_indices, dtype=torch.int64, device=device)
+
+    return _scatter_topk_logprobs_with_tail(logprobs_tensor, indices_tensor, vocab_size)
+
+
 def _load_env_module(env_path: str | None):
     """Load the interaction environment module from a module path or a file path."""
     target = env_path or DEFAULT_ENV_MODULE
@@ -189,24 +262,50 @@ def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict
     return current_image_data, response_tokens, budget, multimodal_train_inputs_buffer
 
 
-async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer):
+async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, vocab_size: int | None = None):
     payload = {
         "input_ids": tokens,
         "sampling_params": sampling_params,
         "return_logprob": True,
+        "return_hidden_states": True,
     }
     if image_data:
         payload["image_data"] = image_data
 
     output = await post(url, payload)
     response_text = output["text"]
-    if "output_token_logprobs" in output["meta_info"]:
-        new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        new_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    output_token_logprobs = output["meta_info"].get("output_token_logprobs", [])
+    if output_token_logprobs:
+        new_tokens = [item[1] for item in output_token_logprobs]
+        new_log_probs = [item[0] for item in output_token_logprobs]
     else:
         new_tokens, new_log_probs = [], []
     finish_type = output["meta_info"]["finish_reason"]["type"]
-    return response_text, new_tokens, new_log_probs, finish_type
+
+    target_logprobs = None
+    if vocab_size is not None and output_token_logprobs:
+        target_logprobs = _extract_and_reconstruct_topk_logprobs(
+            output_token_logprobs, output["meta_info"], vocab_size
+        )
+
+    hs_data = output["meta_info"]["hidden_states"]
+    hidden_states_list = []
+    for i in range(len(hs_data)):
+        h_state = torch.tensor(hs_data[i], dtype=torch.bfloat16)
+        if h_state.numel() == 0:
+            continue
+        if h_state.dim() == 1:
+            h_state = h_state.unsqueeze(0)
+        elif h_state.dim() == 3:
+            h_state = h_state.squeeze(0)
+        hidden_states_list.append(h_state)
+    if hidden_states_list:
+        hidden_states = torch.cat(hidden_states_list, dim=0)
+        engine_hidden_states = hidden_states
+    else:
+        Logger.warning("No valid hidden states found, using empty tensor")
+        engine_hidden_states = torch.empty((0,), dtype=torch.bfloat16)
+    return response_text, new_tokens, new_log_probs, finish_type, engine_hidden_states, target_logprobs
 
 
 def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
@@ -312,6 +411,11 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
     env, env_module, config, state, url = _initialize_resources(args, sample)
     sampling_params = sampling_params.copy()
+    if sampling_params.get("custom_params") is None:
+        sampling_params["custom_params"] = {}
+    if getattr(args, "enable_eagle3", False):
+        sampling_params["custom_params"]["_slime_drafter_return_last_hidden"] = True
+        sampling_params.setdefault("top_logprobs_num", 16)
     current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = _prepare_start_state(
         sample, state, args, sampling_params
     )
@@ -321,15 +425,44 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             return sample
 
+        vocab_size = state.tokenizer.vocab_size
         cur_sampling_params = sampling_params
         for turn_idx in range(config["max_turns"]):
             if budget is not None:
                 cur_sampling_params["max_new_tokens"] = budget
 
-            response_text, new_response_tokens, new_response_log_probs, finish_type = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer
+            response_text, new_response_tokens, new_response_log_probs, finish_type, engine_hidden_states, target_logprobs = await _run_inference_step(
+                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, vocab_size=vocab_size
             )
             _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
+
+            total_len = len(sample.tokens)
+            hs_len = engine_hidden_states.size(0)
+            if hs_len > 0 and hs_len < total_len:
+                aligned = torch.zeros(
+                    total_len, engine_hidden_states.size(-1),
+                    dtype=engine_hidden_states.dtype,
+                    device=engine_hidden_states.device,
+                )
+                aligned[total_len - hs_len:] = engine_hidden_states
+                sample.hidden_states = aligned
+            else:
+                sample.hidden_states = engine_hidden_states
+
+            if target_logprobs is not None:
+                tg_len = target_logprobs.size(0)
+                if tg_len > 0 and tg_len < total_len:
+                    aligned_tg = torch.full(
+                        (total_len, target_logprobs.size(-1)),
+                        float("-inf"),
+                        dtype=target_logprobs.dtype,
+                        device=target_logprobs.device,
+                    )
+                    aligned_tg[total_len - tg_len:] = target_logprobs
+                    sample.target_logprobs = aligned_tg
+                else:
+                    sample.target_logprobs = target_logprobs
+
             budget = _update_budget(budget, len(new_response_tokens))
 
             if _should_stop_on_finish(sample, finish_type):

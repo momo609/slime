@@ -6,14 +6,150 @@ from typing import Any
 
 import yaml
 from sglang_router.launch_router import RouterArgs
+from transformers import AutoConfig
 
-from slime.backends.sglang_utils.arguments import sglang_parse_args
+from slime.backends.sglang_utils.arguments import add_sglang_arguments
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
 
+
+def add_eagle3_arguments(parser):
+    """Add Eagle3 drafter training arguments to the parser."""
+    
+    # Eagle3 training enable
+    parser.add_argument(
+        "--enable-eagle3-training",
+        action="store_true",
+        help="Enable Eagle3 drafter online training"
+    )
+    
+    # Training configuration
+    parser.add_argument(
+        "--eagle3-training-interval-steps",
+        type=int,
+        default=10,
+        help="Training interval in rollout steps"
+    )
+    parser.add_argument(
+        "--eagle3-batch-size-per-gpu",
+        type=int,
+        default=2,
+        help="Batch size per GPU for Eagle3 training"
+    )
+    parser.add_argument(
+        "--eagle3-max-seq-len",
+        type=int,
+        default=8192,
+        help="Maximum sequence length for Eagle3 training"
+    )
+    parser.add_argument(
+        "--eagle3-max-epochs",
+        type=int,
+        default=10,
+        help="Maximum epochs for Eagle3 training"
+    )
+    parser.add_argument(
+        "--eagle3-checkpoint-path",
+        type=str,
+        default=None,
+        help="Path to save Eagle3 checkpoints"
+    )
+    parser.add_argument(
+        "--eagle3-min-workers-for-training",
+        type=int,
+        default=1,
+        help="Minimum workers for Eagle3 training"
+    )
+    parser.add_argument(
+        "--eagle3-collect-hidden-states",
+        action="store_true",
+        default=False,
+        help="Collect hidden states from SGLang for training"
+    )
+    
+    # Model architecture
+    parser.add_argument(
+        "--eagle3-num-layers",
+        type=int,
+        default=1,
+        help="Number of layers in Eagle3 drafter model"
+    )
+    parser.add_argument(
+        "--eagle3-hidden-size",
+        type=int,
+        default=None,
+        help="Hidden size for Eagle3 drafter model (auto from base if not set)"
+    )
+    parser.add_argument(
+        "--eagle3-intermediate-size",
+        type=int,
+        default=None,
+        help="Intermediate size for Eagle3 drafter model (auto from base if not set)"
+    )
+    parser.add_argument(
+        "--eagle3-num-attention-heads",
+        type=int,
+        default=None,
+        help="Number of attention heads for Eagle3 drafter model (auto from base if not set)"
+    )
+    parser.add_argument(
+        "--eagle3-num-key-value-heads",
+        type=int,
+        default=None,
+        help="Number of key-value heads for Eagle3 drafter model (auto from base if not set)"
+    )
+    
+    # Optimizer settings
+    parser.add_argument(
+        "--eagle3-lr",
+        type=float,
+        default=1e-6,
+        help="Learning rate for Eagle3 training"
+    )
+    parser.add_argument(
+        "--eagle3-lr-warmup-steps",
+        type=int,
+        default=1000,
+        help="Learning rate warmup steps for Eagle3"
+    )
+    parser.add_argument(
+        "--eagle3-weight-decay",
+        type=float,
+        default=1e-2,
+        help="Weight decay for Eagle3 optimizer"
+    )
+    parser.add_argument(
+        "--eagle3-warmup-style",
+        type=str,
+        default="constant",
+        choices=["constant", "cosine", "linear"],
+        help="Learning rate warmup style for Eagle3"
+    )
+    
+    # Offload settings
+    parser.add_argument(
+        "--eagle3-offload-param",
+        action="store_true",
+        help="Offload Eagle3 parameters to CPU"
+    )
+    parser.add_argument(
+        "--eagle3-offload-optimizer",
+        action="store_true",
+        help="Offload Eagle3 optimizer to CPU"
+    )
+    
+    # Weight update settings
+    parser.add_argument(
+        "--update-weights-bucket-megabytes",
+        type=int,
+        default=512,
+        help="Bucket size for weight updates (in MB)"
+    )
+    
+    return parser
 
 def reset_arg(parser, name, **kwargs):
     """
@@ -109,7 +245,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
-            # --train-backend is parsed early in _pre_parse_mode() and merged later.
+            parser.add_argument(
+                "--train-backend",
+                type=str,
+                choices=["megatron", "fsdp"],
+                default="megatron",
+                help="The backend for training.",
+            )
             parser.add_argument(
                 "--qkv-format",
                 type=str,
@@ -1107,13 +1249,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
             )
-            # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
-            # are parsed early in _pre_parse_mode() and merged later.
+            parser.add_argument(
+                "--load-debug-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Load the rollout data from this path for debugging. "
+                    "The file will be loaded from `load_debug_rollout_data.format(rollout_id)`. "
+                    "When this is enabled, slime will not instantiate sglang servers."
+                ),
+            )
             parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
                 default=None,
                 help="Subsample a portion of the debug rollout data for faster debugging.",
+            )
+            parser.add_argument(
+                "--debug-rollout-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to only run the rollout generation without training. "
+                    "This is useful for debugging the rollout generation function."
+                ),
+            )
+            parser.add_argument(
+                "--debug-train-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to only run the training without sglang servers. "
+                    "This is useful for debugging the rollout generation function."
+                ),
             )
             parser.add_argument(
                 "--save-debug-train-data",
@@ -1352,6 +1520,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
             )
             return parser
+        
+        def add_sglang_tp_size():
+            temp_parser = argparse.ArgumentParser(add_help=False)
+            temp_parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=1)
+            temp_parser.add_argument("--sglang-pp-size", type=int, default=1)
+            temp_parser.add_argument("--sglang-pipeline-parallel-size", type=int, default=1)
+            temp_args, _ = temp_parser.parse_known_args()
+            # Use sglang_pp_size if set (non-default), otherwise use sglang_pipeline_parallel_size
+            pp_size = (
+                temp_args.sglang_pp_size if temp_args.sglang_pp_size != 1 else temp_args.sglang_pipeline_parallel_size
+            )
+            sglang_tp_size = temp_args.rollout_num_gpus_per_engine // pp_size
+            return sglang_tp_size
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
@@ -1369,12 +1550,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_tensorboard_arguments(parser)
         parser = add_router_arguments(parser)
         parser = add_debug_arguments(parser)
+        parser = add_sglang_arguments(parser)
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_eagle3_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -1383,26 +1566,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             help="Path to the YAML config for custom function arguments.",
         )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
-
+        
+        parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
         return parser
 
     return add_slime_arguments
-
-
-def _pre_parse_mode():
-    """Pre-parse CLI to extract arguments that control parsing flow.
-
-    These arguments are removed from add_slime_arguments to avoid
-    registering them twice.  The returned namespace is merged into
-    the final ``args`` after Phase 2 parsing.
-    """
-    temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
-    temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
-    temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
-    temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
-    temp_args, _ = temp_parser.parse_known_args()
-    return temp_args
 
 
 def parse_args(add_custom_arguments=None):
@@ -1411,46 +1579,69 @@ def parse_args(add_custom_arguments=None):
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
-    pre = _pre_parse_mode()
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
-
-    # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
-    # Skipped when sglang servers are not needed.
-    sglang_ns = None
-    if not skip_sglang:
-        sglang_ns = sglang_parse_args()
-
-    # Phase 2: Parse megatron + slime args.
-    # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
-    # are silently ignored by the megatron parser.
-    from slime.backends.megatron_utils.arguments import megatron_parse_args
+    from slime.backends.megatron_utils.arguments import parse_args as megatron_parse_args
+    from slime.backends.megatron_utils.arguments import set_default_megatron_args
     from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
-    args = megatron_parse_args(
-        extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only,
-    )
+    args = megatron_parse_args(extra_args_provider=add_slime_arguments)
+    if args.hf_checkpoint and not args.debug_rollout_only:
+        hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        hf_validate_args(args, hf_config)
 
-    # Merge pre-parsed args into the main namespace
-    for key, value in vars(pre).items():
-        setattr(args, key, value)
 
-    # Merge sglang args into the main namespace
-    if sglang_ns is not None:
-        for key, value in vars(sglang_ns).items():
-            setattr(args, key, value)
+    args.rank = 0
+    args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    args = set_default_megatron_args(args)
 
     slime_validate_args(args)
 
-    if pre.train_backend == "megatron" and not args.debug_rollout_only:
-        megatron_validate_args(args)
+    megatron_validate_args(args)
 
-    if not args.debug_train_only:
-        sglang_validate_args(args)
+    # always use varlen
+    args.variable_seq_lengths = True
+    if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
+        logger.info(
+            "--moe-token-dispatcher-type allgather does not support variable sequence length, "
+            "please use alltoall dispatcher instead."
+        )
+        args.moe_token_dispatcher_type = "alltoall"
+
+    if args.pipeline_model_parallel_size == 1:
+        assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, (
+            "decoder_first_pipeline_num_layers and decoder_last_pipeline_num_layers should be None when "
+            "pipeline_model_parallel_size is 1."
+        )
+
+    sglang_validate_args(args)
 
     return args
 
+def hf_validate_args(args, hf_config):
+    def equal(x, y):
+        return x == y
 
+    errors = []
+
+    # multimodal models have different config structure
+    if hasattr(hf_config, "text_config"):
+        hf_config = hf_config.text_config
+
+    for hf_config_name, megatron_config_name, compare_fn in [
+        ("hidden_size", "hidden_size", equal),
+        ("num_attention_heads", "num_attention_heads", equal),
+        ("num_hidden_layers", "num_layers", equal),
+        ("intermediate_size", "ffn_hidden_size", equal),
+        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+        ("rms_norm_eps", "norm_epsilon", equal),
+        ("rope_theta", "rotary_base", equal),
+    ]:
+        if hasattr(hf_config, hf_config_name):
+            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
+                errors.append(
+                    f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
+                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+                )
+    
 def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     """
     Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.
@@ -1664,9 +1855,9 @@ def slime_validate_args(args):
     # always true on offload for colocate at the moment.
     if args.colocate:
         if args.offload_train is None:
-            args.offload_train = True
+            args.offload_train = False
         if args.offload_rollout is None:
-            args.offload_rollout = True
+            args.offload_rollout = False
         if args.rollout_num_gpus != args.actor_num_gpus_per_node * args.actor_num_nodes:
             logger.info(
                 f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "

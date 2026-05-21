@@ -25,6 +25,7 @@ from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, co
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
+from slime.utils.common import is_npu
 
 from ..utils.metric_utils import has_repetition
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -91,6 +92,7 @@ class ServerGroup:
         RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
+        device_name = "NPU" if is_npu() else "GPU"
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
@@ -120,17 +122,17 @@ class ServerGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                    "SLIME_ENABLE_PROFILING": "true",
+                    "SLIME_ENABLE_PROFILING": "false",
                 }.items()
             }
 
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
-                num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": env_vars,
                 },
+                resources={device_name: num_gpus}
             ).remote(
                 self.args,
                 rank=global_rank,
@@ -380,7 +382,8 @@ class RolloutManager:
             self.servers = start_rollout_servers(args, pg)
 
         init_tracking(args, primary=False)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        device_name = "NPU" if is_npu() else "GPU"
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name: 0}).remote()
         self.rollout_id = -1
 
         self._health_monitors = []
@@ -485,9 +488,6 @@ class RolloutManager:
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
-        if self.args.debug_rollout_only:
-            # if debug rollout only, we don't convert samples to train data and directly return
-            return
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
 
@@ -588,7 +588,7 @@ class RolloutManager:
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
-            if not self.args.disable_rollout_trim_samples and not self.args.debug_rollout_only:
+            if not self.args.disable_rollout_trim_samples:
                 global_batch_size = self.args.global_batch_size
                 if self.args.use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
@@ -742,6 +742,13 @@ class RolloutManager:
 
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        
+        # Add hidden states for Eagle3 training
+        if samples[0].hidden_states is not None:
+            train_data["hidden_states"] = [sample.hidden_states for sample in samples]
+        if samples[0].target_logprobs is not None:
+            train_data["target_logprobs"] = [sample.target_logprobs for sample in samples]
+
 
         return train_data
 
@@ -780,6 +787,8 @@ class RolloutManager:
                 "sample_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
+                "hidden_states",  # Add hidden states for Eagle3
+                "target_logprobs",  # Add target logprobs for Eagle3
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -833,6 +842,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 4. other ports for dp_attention, which is of size 4 + dp_size
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    print(f"================== num_gpus_per_engine {num_gpus_per_engine} rollout_num_gpus_per_engine {args.rollout_num_gpus_per_engine} _gpus_per_engine {_gpus_per_engine} num_gpus_per_node {args.num_gpus_per_node}")
     addr_and_ports: dict[int, dict] = {}
 
     # Track per-node port cursors so that different server groups (called
@@ -843,6 +853,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     for rank, engine in rollout_engines:
         local_rank = rank - rank_offset
         node_index = local_rank // num_engines_per_node
+        print(f"===================== local_rank {local_rank} node_index {node_index} rank {rank} rank_offset {rank_offset} num_engines_per_node {num_engines_per_node} =================")
         if node_index in visited_nodes:
             continue
         visited_nodes.add(node_index)
